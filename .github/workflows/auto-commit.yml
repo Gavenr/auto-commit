@@ -1,0 +1,151 @@
+name: Auto Commit with Weather & Motivation
+
+on:
+  schedule:
+    - cron: '* * * * *'  # 每分钟触发
+  workflow_dispatch:
+
+jobs:
+  auto_commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置为北京时间
+        run: |
+          sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+      - name: 生成或读取今日提交时间计划
+        id: plan
+        run: |
+          mkdir -p .github
+
+          # ✅ 清理 2 天前的旧文件
+          find .github -type f \( -name "auto_commit_plan_*.txt" -o -name "auto_commit_done_*.txt" \) -mtime +2 -delete
+
+          TODAY=$(date +'%Y-%m-%d')
+          PLAN_FILE=".github/auto_commit_plan_$TODAY.txt"
+
+          if [[ -f "$PLAN_FILE" ]]; then
+            echo "已存在今日计划："
+            cat "$PLAN_FILE"
+          else
+            COUNT=$((RANDOM % 4 + 2))  # 2~5 次提交
+            TIMES=()
+            while [ ${#TIMES[@]} -lt $COUNT ]; do
+              HOUR=$((RANDOM % 15 + 8))  # 8~22 点
+              MIN=$((RANDOM % 60))
+              TIME=$(printf "%02d:%02d" $HOUR $MIN)
+              if [[ ! " ${TIMES[*]} " =~ " $TIME " ]]; then
+                TIMES+=("$TIME")
+                echo "$TIME" >> "$PLAN_FILE"
+              fi
+            done
+            echo "今日提交计划：${TIMES[*]}"
+          fi
+
+      - name: 检查当前时间是否匹配
+        id: check
+        run: |
+          # ✅ 加锁防并发
+          LOCK_FILE="/tmp/auto_commit.lock"
+          exec 200>"$LOCK_FILE"
+          flock -n 200 || exit 0
+
+          TODAY=$(date +'%Y-%m-%d')
+          NOW=$(date +'%H:%M')
+          PLAN_FILE=".github/auto_commit_plan_$TODAY.txt"
+          DONE_FILE=".github/auto_commit_done_$TODAY.txt"
+
+          mkdir -p .github
+          touch "$DONE_FILE"
+
+          SHOULD_RUN=false
+
+          if grep -Fxq "$NOW" "$PLAN_FILE" && ! grep -Fxq "$NOW" "$DONE_FILE"; then
+            echo "$NOW" >> "$DONE_FILE"
+            echo "匹配到计划时间 $NOW，准备执行提交"
+            SHOULD_RUN=true
+          else
+            echo "当前时间 $NOW 不在计划内或已执行过"
+          fi
+
+          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+
+      - name: 退出非提交时间
+        if: steps.check.outputs.should_run != 'true'
+        run: echo "不是提交时间，退出任务"
+
+      - name: 获取重庆实时天气（Open-Meteo）
+        id: weather
+        run: |
+          LAT=29.56301
+          LON=106.55156
+          DATA=$(curl -s "https://api.open-meteo.com/v1/forecast?latitude=$LAT&longitude=$LON&current=temperature_2m,weathercode&timezone=auto")
+          TEMP=$(echo "$DATA" | jq '.current.temperature_2m')
+          CODE=$(echo "$DATA" | jq '.current.weathercode')
+
+          case $CODE in
+            0) DESC="☀️ 晴天" ;;
+            1|2|3) DESC="⛅ 多云" ;;
+            45|48) DESC="🌫️ 雾霾" ;;
+            51|53|55|61|63|65) DESC="🌦️ 小雨" ;;
+            80|81|82) DESC="🌧️ 阵雨" ;;
+            95|96|99) DESC="⛈️ 雷暴" ;;
+            *) DESC="🌈 未知天气" ;;
+          esac
+
+          echo "weather_desc=$DESC" >> $GITHUB_OUTPUT
+          echo "weather_temp=$TEMP°C" >> $GITHUB_OUTPUT
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: 写入日志并提交
+        run: |
+          TODAY=$(date '+%Y-%m-%d（%A）')
+          TIME=$(date '+%H:%M:%S')
+          LUNAR="农历：$(date +'%m')月$(date +'%d')日"
+
+          MSGS=(
+            "🌟 Keep going, everything you need will come to you."
+            "💪 Believe in yourself!"
+            "🚀 Push your limits!"
+            "🔥 Focus and win."
+            "🍀 Good things take time."
+            "🐱 Stay curious."
+            "🧠 Learn something new today."
+            "✨ You are unstoppable."
+          )
+          MSG="${MSGS[$RANDOM % ${#MSGS[@]}]}"
+
+          echo "📅 $TODAY" >> log.txt
+          echo "⏰ $TIME" >> log.txt
+          echo "🗓️ $LUNAR" >> log.txt
+          echo "⛅ 天气：${{ steps.weather.outputs.weather_desc }}，${{ steps.weather.outputs.weather_temp }}" >> log.txt
+          echo "$MSG" >> log.txt
+
+          COUNT_FILE=".github/commit_count.txt"
+          if [ -f "$COUNT_FILE" ]; then
+            COUNT=$(cat $COUNT_FILE)
+          else
+            COUNT=0
+          fi
+          COUNT=$((COUNT + 1))
+          echo "$COUNT" > $COUNT_FILE
+          echo "🔢 已提交 $COUNT 次" >> log.txt
+          echo "----------------------------------------" >> log.txt
+
+          git add log.txt $COUNT_FILE
+          git commit -m "📅 Auto commit on $(date '+%Y-%m-%d')" || echo "无变化可提交"
+
+      - name: 推送代码
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote set-url origin https://x-access-token:$TOKEN@github.com/${{ github.repository }}.git
+          git push origin HEAD:${{ github.ref_name }}
